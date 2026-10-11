@@ -9,7 +9,7 @@ import { pushSupported, enablePush, disablePush, sendTestPush } from '../lib/pus
 import { wakeLockSupported } from '../lib/wakelock.js'
 import { t, LANGS, INSTR_LANGS } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
-import { MOBILE, shareExport, syncReminder } from '../lib/mobile.js'
+import { MOBILE, shareExport, syncReminder, storageNote } from '../lib/mobile.js'
 import { loadStarterPlan, confirmSheet, importFromApp } from '../sheets.jsx'
 import { coachAvailable, hasConsent } from '../lib/coach.js'
 import { forgetCoach } from '../lib/coach-api.js'
@@ -78,7 +78,7 @@ export default function Settings() {
     {/* ---------- account (demo and mobile builds have nothing to sign in to) ---------- */}
     <Section title={MOBILE ? t('Your data') : DEMO ? t('Demo') : t('Account')}>
       {MOBILE ? <>
-        <Row icon="lock" iconTint="var(--acc)" title={t('All data stays on this phone')} subtitle={t('No account, no cloud — back it up anytime with Export below.')} />
+        <Row icon="lock" iconTint="var(--acc)" title={storageNote()} subtitle={t('Back it up anytime with Export below.')} />
         <Row icon="rocket" iconTint="var(--indigo)" title={t('Self-host openGym')} subtitle={t('Passkey sign-in, sync across your devices, your own data.')} accessory="chevron"
           onClick={() => window.open(REPO, '_blank', 'noopener')} />
       </> : DEMO ? <>
@@ -153,7 +153,7 @@ export default function Settings() {
       </Section>
     )}
 
-    {(user || MOBILE) && <NotificationsCard S={S} update={update} toast={toast} />}
+    {user && <NotificationsCard S={S} update={update} toast={toast} />}
 
     {/* ---------- appearance ---------- */}
     <Section title={t('Appearance')} footer={DEMO || MOBILE ? undefined : t('synced with your profile')}>

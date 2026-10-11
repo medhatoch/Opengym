@@ -47,7 +47,7 @@ export const useStore = create((set, get) => {
   const persist = (S, push = true) => {
     S._ts = Date.now()
     registerCustom(S.customEx)
-    localStorage.setItem(KEY, JSON.stringify(S))
+    try { localStorage.setItem(KEY, JSON.stringify(S)) } catch (e) { /* storage blocked or full — remote copy still saves */ }
     set({ S })
     if (MOBILE) nativePersist()
     if (push && get().user) {
@@ -100,7 +100,7 @@ export const useStore = create((set, get) => {
     },
     replaceState(S, push = false) { persist(clone(S), push) },
 
-    isGuest: () => localStorage.getItem('gym_guest') === '1',
+    isGuest: () => { if (MOBILE) return true; try { return localStorage.getItem('gym_guest') === '1' } catch (e) { return false } },
     setGuest(v) { if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest'); set({}) },
 
     setUser(u) {
@@ -158,15 +158,24 @@ export const useStore = create((set, get) => {
       // Mobile build: no backend either — restore from the file mirror (the durable copy;
       // localStorage may have been evicted since the last run) and go straight in.
       if (MOBILE) {
-        const saved = await nativeLoad()
-        const S = get().S
-        if (saved && (!hasData(S) || (saved._ts || 0) >= (S._ts || 0))) {
-          persist(Object.assign(clone(DEF), saved), false)
-        } else if (hasData(S)) {
-          nativeSave(S)   // first run after an update from a file-less version: seed the mirror
+        // Pocket build: the remote copy can take a moment (or never answer when the page is
+        // opened on its own), so don't hold the app hostage — start from the local copy after
+        // a short wait and adopt the remote one whenever it arrives, if it is newer.
+        const adopt = saved => {
+          const S = get().S
+          if (saved && (!hasData(S) || (saved._ts || 0) > (S._ts || 0))) {
+            const ts = saved._ts
+            persist(Object.assign(clone(DEF), saved), false)
+            get().S._ts = ts
+          } else if (hasData(S)) {
+            nativeSave(S)   // remote copy missing or older: seed / refresh it
+          }
         }
-        get().setGuest(true)
-        syncReminder(get().S)
+        const loading = nativeLoad()
+        const first = await Promise.race([loading, new Promise(r => setTimeout(() => r(undefined), 4000))])
+        if (first === undefined) loading.then(adopt)
+        else adopt(first)
+        try { get().setGuest(true) } catch (e) { /* storage blocked */ }
         set({ ready: true })
         return
       }

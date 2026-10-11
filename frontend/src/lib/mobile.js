@@ -1,68 +1,110 @@
-// Mobile build (VITE_MOBILE=1) — the standalone app-store version (Capacitor native shell).
+// Pocket build (VITE_MOBILE=1, web flavour) — openGym running as a hosted page on iPhone,
+// with no openGym server behind it.
 //
-// There is no backend: nothing to sign in to, everything lives on the phone. Unlike guest
-// mode in a browser, this is the user's only copy of their training log, so it can't depend
-// on WebView localStorage alone (iOS evicts that under storage pressure). Every persist()
-// therefore also lands in a JSON file in the app's private data directory, and boot()
-// restores from it. The workout reminder uses native local notifications scheduled per
-// planned weekday — no server involved, unlike Web Push in the self-hosted version.
-//
-// Like the demo build, MOBILE is replaced at build time, so all of this folds away in
-// web bundles; the Capacitor plugins are only ever imported behind it.
+// Upstream, VITE_MOBILE meant the Capacitor native shell. This fork keeps the same switch
+// (no backend, no sign-in, guest mode) but swaps the native plugins for what the hosting
+// page offers:
+//   * durable copy of the training log — the page's private per-user document store
+//     (`claude.use("db")`), mirrored on every save. localStorage stays the fast local copy,
+//     but iOS can evict it, so the remote copy is the one that matters.
+//   * backups — `claude.use("downloads")` (the iOS share sheet / a browser download), with a
+//     plain Web Share / blob download as the fallback when the page runs on its own.
+//   * reminders — not available on the web without a push server, so the card is hidden.
 import { t } from './i18n.js'
 
 export const MOBILE = import.meta.env.VITE_MOBILE === '1'
 
-const FILE = 'opengym-state.json'
+// ---------- remote store ----------
+// The whole state is serialized once and split into fixed-size string chunks, because one
+// document is capped at 256 KiB and a multi-year log can outgrow that. A meta document
+// records how many chunks the current version uses and its timestamp.
+const CHUNK = 180000
+let dbRef = null          // { db, base } once resolved, false if unavailable
+let dbPromise = null
+const written = []        // last chunk strings written, to skip unchanged chunks
+let writing = Promise.resolve()
+
+function cap(name) {
+  try { return window.claude?.use ? window.claude.use(name) : Promise.resolve(null) }
+  catch (e) { return Promise.resolve(null) }
+}
+
+function remote() {
+  if (!dbPromise) {
+    dbPromise = (async () => {
+      try {
+        const [db, user] = await Promise.all([cap('db'), cap('user')])
+        if (!db || !user) return (dbRef = false)
+        const id = await user.id()
+        if (!id) return (dbRef = false)
+        return (dbRef = { db, base: 'data/users/' + id })
+      } catch (e) { return (dbRef = false) }
+    })()
+  }
+  return dbPromise
+}
+
+export function remoteAvailable() { return dbRef ? true : dbRef === false ? false : null }
 
 export async function nativeLoad() {
+  const r = await remote()
+  if (!r) return null
   try {
-    const { Filesystem, Directory, Encoding } = await import('@capacitor/filesystem')
-    const r = await Filesystem.readFile({ path: FILE, directory: Directory.Data, encoding: Encoding.UTF8 })
-    return JSON.parse(r.data)
-  } catch (e) { return null }   // first launch, or unreadable — localStorage copy takes over
+    const meta = await r.db.doc(r.base + '/gym-meta').get()
+    if (!meta.exists) return null
+    const { n, ts } = meta.data()
+    const parts = await Promise.all(Array.from({ length: n }, (_, i) => r.db.doc(r.base + '/gym-part-' + i).get()))
+    const s = parts.map(p => (p.exists ? p.data().s : '')).join('')
+    const state = JSON.parse(s)
+    parts.forEach((p, i) => { written[i] = p.exists ? p.data().s : null })
+    if (ts && !state._ts) state._ts = ts
+    return state
+  } catch (e) { return null }
 }
 
-export async function nativeSave(state) {
-  try {
-    const { Filesystem, Directory, Encoding } = await import('@capacitor/filesystem')
-    await Filesystem.writeFile({ path: FILE, directory: Directory.Data, data: JSON.stringify(state), encoding: Encoding.UTF8 })
-  } catch (e) { /* keep the localStorage copy */ }
+export function nativeSave(state) {
+  // Serialize the writes: one at a time per document, never overlapping.
+  writing = writing.then(async () => {
+    const r = await remote()
+    if (!r) return
+    try {
+      const json = JSON.stringify(state)
+      const chunks = []
+      for (let i = 0; i < json.length; i += CHUNK) chunks.push(json.slice(i, i + CHUNK))
+      if (!chunks.length) chunks.push('{}')
+      for (let i = 0; i < chunks.length; i++) {
+        if (written[i] === chunks[i]) continue
+        await r.db.doc(r.base + '/gym-part-' + i).set({ s: chunks[i] })
+        written[i] = chunks[i]
+      }
+      await r.db.doc(r.base + '/gym-meta').set({ n: chunks.length, ts: state._ts || Date.now(), v: 1 })
+    } catch (e) { /* the localStorage copy stays; the next save tries again */ }
+  })
+  return writing
 }
 
-// (Re)schedule the workout-day reminder: one repeating notification per weekday that has a
-// routine in the weekly plan. Cheap enough to run after any state change — the plan or the
-// reminder time may just have been edited. `interactive` gates the OS permission prompt to
-// the Settings toggle; a background resync never pops a dialog.
-export async function syncReminder(S, interactive = false) {
-  try {
-    const { LocalNotifications } = await import('@capacitor/local-notifications')
-    await LocalNotifications.cancel({ notifications: [0, 1, 2, 3, 4, 5, 6].map(d => ({ id: 100 + d })) }).catch(() => {})
-    const r = S.reminder
-    if (!r?.on) return true
-    let perm = await LocalNotifications.checkPermissions()
-    if (perm.display !== 'granted' && interactive) perm = await LocalNotifications.requestPermissions()
-    if (perm.display !== 'granted') return false
-    const [hour, minute] = (r.time || '08:00').split(':').map(Number)
-    const notifications = Object.entries(S.week || {})
-      .filter(([, rid]) => rid && (S.routines || []).some(x => x.id === rid))
-      .map(([day, rid]) => ({
-        id: 100 + Number(day),
-        title: t('Workout day'),
-        body: t('{0} is on the plan today — let’s go!', S.routines.find(x => x.id === rid).name),
-        // Capacitor weekdays are 1 (Sunday) … 7 (Saturday); S.week uses getDay() 0…6.
-        schedule: { on: { weekday: Number(day) + 1, hour, minute }, allowWhileIdle: true },
-      }))
-    if (notifications.length) await LocalNotifications.schedule({ notifications })
-    return true
-  } catch (e) { return false }
-}
+// No web reminders here (no push server); kept so the store's calls stay unchanged.
+export async function syncReminder() { return false }
 
-// WKWebView can't do blob-URL downloads, so the backup goes out through the OS share sheet
-// (Files, AirDrop, mail, …) from a temp file instead.
+// ---------- backups ----------
 export async function shareExport(json, filename) {
-  const { Filesystem, Directory, Encoding } = await import('@capacitor/filesystem')
-  const { Share } = await import('@capacitor/share')
-  const w = await Filesystem.writeFile({ path: filename, directory: Directory.Cache, data: json, encoding: Encoding.UTF8 })
-  await Share.share({ title: filename, url: w.uri })
+  const dl = await cap('downloads')
+  if (dl) {
+    try { await dl.save({ filename, data: json }); return }
+    catch (e) {
+      if (e && e.code === 'declined') throw e
+      // anything else: fall through to the plain browser routes
+    }
+  }
+  try {
+    const file = new File([json], filename, { type: 'application/json' })
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: filename }); return }
+  } catch (e) { if (e && e.name === 'AbortError') throw e }
+  const blob = new Blob([json], { type: 'application/json' })
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000)
 }
+
+export const storageNote = () => remoteAvailable()
+  ? t('Saved to your Claude account and on this device')
+  : t('Saved on this device only — export a backup regularly')

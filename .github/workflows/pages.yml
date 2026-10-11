@@ -1,17 +1,16 @@
-# Publishes the browser-only demo to GitHub Pages: https://duartesantos8.github.io/openGym/
+# Publishes my personal openGym build to GitHub Pages — install it on iPhone from Safari
+# (Share → Add to Home Screen).
 #
-# Pages serves static files only, so this build has no backend — VITE_DEMO=1 makes the app
-# boot straight into guest mode with a seeded example history (see frontend/src/lib/demo.js).
-# The exercise images/GIFs (~140 MB) are never committed here; the demo build points at the
-# upstream dataset on jsDelivr instead, pinned to a commit so the CDN can cache it forever.
-name: Deploy demo to GitHub Pages
+# Pages serves static files only, so there is no backend: VITE_MOBILE=1 runs the app with no
+# sign-in, everything stored on the phone (back it up with Settings → Export). VITE_PAGES=1
+# keeps the service worker on for offline use. The exercise images and animated demos
+# (~140 MB) are not committed here; they come from the upstream dataset on jsDelivr, pinned
+# to a commit so the CDN and the browser can cache them for good.
+name: Deploy to GitHub Pages
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'frontend/**'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -38,10 +37,11 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
         working-directory: frontend
-      - run: npm run build
+      - run: npx vite build
         working-directory: frontend
         env:
-          VITE_DEMO: '1'
+          VITE_MOBILE: '1'
+          VITE_PAGES: '1'
           VITE_IMG_BASE: ${{ env.DATASET }}/images/
           VITE_GIF_BASE: ${{ env.DATASET }}/videos/
       - uses: actions/configure-pages@v6
